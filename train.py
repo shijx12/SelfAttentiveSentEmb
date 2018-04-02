@@ -1,204 +1,210 @@
 from __future__ import print_function
-from models import *
-
-from util import Dictionary, get_args
+from __future__ import division
+from models import Classifier
+from util import *
+from dataset.age2 import AGE2
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
+import tensorboard
+from torch import nn, optim
+from torch.optim import lr_scheduler
+from torch.nn.utils import clip_grad_norm
 from torch.autograd import Variable
-
-import json
+import numpy as np
 import time
 import random
+import argparse
 import os
+import logging
+from IPython import embed
 
 
-def Frobenius(mat):
-    size = mat.size()
-    if len(size) == 3:  # batched matrix
-        ret = (torch.sum(torch.sum((mat ** 2), 1), 2).squeeze() + 1e-10) ** 0.5
-        return torch.sum(ret) / size[0]
-    else:
-        raise Exception('matrix for computing Frobenius norm should be with 3 dims')
 
-
-def package(data, volatile=False):
-    """Package data for training / evaluation."""
-    data = map(lambda x: json.loads(x), data)
-    dat = map(lambda x: map(lambda y: dictionary.word2idx[y], x['text']), data)
-    maxlen = 0
-    for item in dat:
-        maxlen = max(maxlen, len(item))
-    targets = map(lambda x: x['label'], data)
-    maxlen = min(maxlen, 500)
-    for i in range(len(data)):
-        if maxlen < len(dat[i]):
-            dat[i] = dat[i][:maxlen]
-        else:
-            for j in range(maxlen - len(dat[i])):
-                dat[i].append(dictionary.word2idx['<pad>'])
-    dat = Variable(torch.LongTensor(dat), volatile=volatile)
-    targets = Variable(torch.LongTensor(targets), volatile=volatile)
-    return dat.t(), targets
-
-
-def evaluate():
-    """evaluate the model while training"""
-    model.eval()  # turn on the eval() switch to disable dropout
-    total_loss = 0
-    total_correct = 0
-    for batch, i in enumerate(range(0, len(data_val), args.batch_size)):
-        data, targets = package(data_val[i:min(len(data_val), i+args.batch_size)], volatile=True)
-        if args.cuda:
-            data = data.cuda()
-            targets = targets.cuda()
-        hidden = model.init_hidden(data.size(1))
-        output, attention = model.forward(data, hidden)
-        output_flat = output.view(data.size(1), -1)
-        total_loss += criterion(output_flat, targets).data
-        prediction = torch.max(output_flat, 1)[1]
-        total_correct += torch.sum((prediction == targets).float())
-    return total_loss[0] / (len(data_val) // args.batch_size), total_correct.data[0] / len(data_val)
-
-
-def train(epoch_number):
-    global best_val_loss, best_acc
+def train_iter(args, batch, **kw):
+    model, params, criterion, optimizer = kw['model'], kw['params'], kw['criterion'], kw['optimizer']
     model.train()
-    total_loss = 0
-    total_pure_loss = 0  # without the penalization term
-    start_time = time.time()
-    for batch, i in enumerate(range(0, len(data_train), args.batch_size)):
-        data, targets = package(data_train[i:i+args.batch_size], volatile=False)
-        if args.cuda:
-            data = data.cuda()
-            targets = targets.cuda()
-        hidden = model.init_hidden(data.size(1))
-        output, attention = model.forward(data, hidden)
-        loss = criterion(output.view(data.size(1), -1), targets)
-        total_pure_loss += loss.data
+    words, length, label = batch
+    length = wrap_with_variable(length, volatile=False, cuda=args.cuda)
+    words = wrap_with_variable(words, volatile=False, cuda=args.cuda)
+    label = wrap_with_variable(label, volatile=False, cuda=args.cuda)
+    logits, supplements = model.forward(words=words, length=length)
+    label_pred = logits.max(1)[1]
+    accuracy = torch.eq(label, label_pred).float().mean()
+    num_correct = torch.eq(label, label_pred).long().sum()
+    loss = criterion(input=logits, target=label)
 
-        if attention:  # add penalization term
-            attentionT = torch.transpose(attention, 1, 2).contiguous()
-            extra_loss = Frobenius(torch.bmm(attention, attentionT) - I[:attention.size(0)])
-            loss += args.penalization_coeff * extra_loss
-        optimizer.zero_grad()
-        loss.backward()
+    if args.penalization_coeff > 0:
+        I = kw['I']
+        attention = supplements['attention']
+        attentionT = torch.transpose(attention, 1, 2).contiguous()
+        extra_loss = Frobenius(torch.bmm(attention, attentionT) - I)
+        loss += args.penalization_coeff * extra_loss
 
-        nn.utils.clip_grad_norm(model.parameters(), args.clip)
-        optimizer.step()
-
-        total_loss += loss.data
-
-        if batch % args.log_interval == 0 and batch > 0:
-            elapsed = time.time() - start_time
-            print('| epoch {:3d} | {:5d}/{:5d} batches | ms/batch {:5.2f} | loss {:5.4f} | pure loss {:5.4f}'.format(
-                  epoch_number, batch, len(data_train) // args.batch_size,
-                  elapsed * 1000 / args.log_interval, total_loss[0] / args.log_interval,
-                  total_pure_loss[0] / args.log_interval))
-            total_loss = 0
-            total_pure_loss = 0
-            start_time = time.time()
-
-#            for item in model.parameters():
-#                print item.size(), torch.sum(item.data ** 2), torch.sum(item.grad ** 2).data[0]
-#            print model.encoder.ws2.weight.grad.data
-#            exit()
-    evaluate_start_time = time.time()
-    val_loss, acc = evaluate()
-    print('-' * 89)
-    fmt = '| evaluation | time: {:5.2f}s | valid loss (pure) {:5.4f} | Acc {:8.4f}'
-    print(fmt.format((time.time() - evaluate_start_time), val_loss, acc))
-    print('-' * 89)
-    # Save the model, if the validation loss is the best we've seen so far.
-    if not best_val_loss or val_loss < best_val_loss:
-        with open(args.save, 'wb') as f:
-            torch.save(model, f)
-        f.close()
-        best_val_loss = val_loss
-    else:  # if loss doesn't go down, divide the learning rate by 5.
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = param_group['lr'] * 0.2
-    if not best_acc or acc > best_acc:
-        with open(args.save[:-3]+'.best_acc.pt', 'wb') as f:
-            torch.save(model, f)
-        f.close()
-        best_acc = acc
-    with open(args.save[:-3]+'.epoch-{:02d}.pt'.format(epoch_number), 'wb') as f:
-        torch.save(model, f)
-    f.close()
+    optimizer.zero_grad()
+    loss.backward()
+    clip_grad_norm(parameters=params, max_norm=0.5)
+    optimizer.step()
+    return loss, accuracy
 
 
-if __name__ == '__main__':
-    # parse the arguments
-    args = get_args()
+def eval_iter(args, model, batch):
+    model.eval()
+    words, length, label = batch
+    length = wrap_with_variable(length, volatile=False, cuda=args.cuda)
+    words = wrap_with_variable(words, volatile=False, cuda=args.cuda)
+    label = wrap_with_variable(label, volatile=False, cuda=args.cuda)
+    logits, supplements = model(words=words, length=length)
+    label_pred = logits.max(1)[1]
+    num_correct = torch.eq(label, label_pred).long().sum()
+    return num_correct, supplements 
 
-    # Set the random seed manually for reproducibility.
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--word-dim', type=int, default=300, help='size of word embeddings')
+    parser.add_argument('--hidden-dim', type=int, default=300, help='number of hidden units per layer')
+    parser.add_argument('--num-layers', type=int, default=2, help='number of layers in BiLSTM')
+    parser.add_argument('--att-dim', type=int, default=350, help='number of attention unit')
+    parser.add_argument('--att-hops', type=int, default=4, help='number of attention hops, for multi-hop attention model')
+    parser.add_argument('--clf-hidden-dim', type=int, default=512, help='hidden (fully connected) layer size for classifier MLP')
+    parser.add_argument('--penalization-coeff', type=float, default=1, help='the penalization coefficient')
+    parser.add_argument('--clip', type=float, default=0.5, help='clip to prevent the too large grad in LSTM')
+    parser.add_argument('--lr', type=float, default=.001, help='initial learning rate')
+    parser.add_argument('--weight-decay', type=float, default=1e-5, help='weight decay rate per batch')
+    parser.add_argument('--dropout', type=float, default=0.5)
+    parser.add_argument('--max-epoch', type=int, default=20)
+    parser.add_argument('--seed', type=int, default=1111)
+    parser.add_argument('--cuda', action='store_true', default=True)
+    parser.add_argument('--optimizer', default='adam', choices=['adam', 'sgd'])
+    parser.add_argument('--batch-size', type=int, default=32, help='batch size for training')
+
+
+    parser.add_argument('--num-classes', type=int, default=5, help='number of classes')
+    parser.add_argument('--data', type=str, default='./data/age2.pickle')
+    parser.add_argument('--save-dir', type=str, required=True, help='path to save the final model')
+    parser.add_argument('--fix-word-embedding', action='store_true')
+    args = parser.parse_args()
+
     torch.manual_seed(args.seed)
+    random.seed(args.seed)
     if torch.cuda.is_available():
         if not args.cuda:
             print("WARNING: You have a CUDA device, so you should probably run with --cuda")
         else:
             torch.cuda.manual_seed(args.seed)
-    random.seed(args.seed)
+    #######################################
+    # a simple log file, the same content as stdout
+    if not os.path.exists(args.save_dir):
+        os.mkdir(args.save_dir)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)-8s %(message)s')
+    logFormatter = logging.Formatter('%(asctime)s %(levelname)-8s %(message)s')
+    rootLogger = logging.getLogger()
+    fileHandler = logging.FileHandler(os.path.join(args.save_dir, 'stdout.log'))
+    fileHandler.setFormatter(logFormatter)
+    rootLogger.addHandler(fileHandler)
+    ########################################
+    for k, v in vars(args).items():
+        logging.info(k+':'+str(v))
 
-    # Load Dictionary
-    assert os.path.exists(args.train_data)
-    assert os.path.exists(args.val_data)
-    print('Begin to load the dictionary.')
-    dictionary = Dictionary(path=args.dictionary)
 
-    best_val_loss = None
-    best_acc = None
+    data = AGE2(datapath=args.data, batch_size=args.batch_size)
 
-    n_token = len(dictionary)
-    model = Classifier({
-        'dropout': args.dropout,
-        'ntoken': n_token,
-        'nlayers': args.nlayers,
-        'nhid': args.nhid,
-        'ninp': args.emsize,
-        'pooling': 'all',
-        'attention-unit': args.attention_unit,
-        'attention-hops': args.attention_hops,
-        'nfc': args.nfc,
-        'dictionary': dictionary,
-        'word-vector': args.word_vector,
-        'class-number': args.class_number
-    })
+    model = Classifier(
+        dictionary=data,
+        dropout=args.dropout,
+        num_words=data.num_words,
+        num_layers=args.num_layers,
+        hidden_dim=args.hidden_dim,
+        word_dim=args.word_dim,
+        att_dim=args.att_dim,
+        att_hops=args.att_hops,
+        clf_hidden_dim=args.clf_hidden_dim,
+        num_classes=args.num_classes
+    )
+    logging.info(model)
+
+    model.word_embedding.weight.data.set_(data.weight)
+    if args.fix_word_embedding:
+        model.word_embedding.weight.requires_grad = False
     if args.cuda:
         model = model.cuda()
-
-    print(args)
-    I = Variable(torch.zeros(args.batch_size, args.attention_hops, args.attention_hops))
-    for i in range(args.batch_size):
-        for j in range(args.attention_hops):
-            I.data[i][j][j] = 1
+    ''' count parameters
+    num_params = sum(np.prod(p.size()) for p in model.parameters())
+    num_embedding_params = np.prod(model.word_embedding.weight.size())
+    print('# of parameters: %d' % num_params)
+    print('# of word embedding parameters: %d' % num_embedding_params)
+    print('# of parameters (excluding word embeddings): %d' % (num_params - num_embedding_params))
+    '''
+    if args.optimizer == 'adam':
+        optimizer_class = optim.Adam
+    elif args.optimizer == 'sgd':
+        optimizer_class = optim.SGD
+    else:
+        raise Exception('For other optimizers, please add it yourself. supported ones are: SGD and Adam.')
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optimizer_class(params=params, lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer=optimizer, mode='max', factor=0.5, patience=10, verbose=True)
+    criterion = nn.CrossEntropyLoss()
+    # Identity matrix for each batch
+    I = Variable(torch.eye(args.att_hops).unsqueeze(0).expand(args.batch_size, -1, -1))
     if args.cuda:
         I = I.cuda()
+    trpack = {
+            'model': model,
+            'params': params, 
+            'criterion': criterion, 
+            'optimizer': optimizer,
+            'I': I,
+            }
 
-    criterion = nn.CrossEntropyLoss()
-    if args.optimizer == 'Adam':
-        optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=[0.9, 0.999], eps=1e-8, weight_decay=0)
-    elif args.optimizer == 'SGD':
-        optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=0.01)
-    else:
-        raise Exception('For other optimizers, please add it yourself. '
-                        'supported ones are: SGD and Adam.')
-    print('Begin to load data.')
-    data_train = open(args.train_data).readlines()
-    data_val = open(args.val_data).readlines()
-    try:
-        for epoch in range(args.epochs):
-            train(epoch)
-    except KeyboardInterrupt:
-        print('-' * 89)
-        print('Exit from training early.')
-        data_val = open(args.test_data).readlines()
-        evaluate_start_time = time.time()
-        test_loss, acc = evaluate()
-        print('-' * 89)
-        fmt = '| test | time: {:5.2f}s | test loss (pure) {:5.4f} | Acc {:8.4f}'
-        print(fmt.format((time.time() - evaluate_start_time), test_loss, acc))
-        print('-' * 89)
-        exit(0)
+    train_summary_writer = tensorboard.FileWriter(
+        logdir=os.path.join(args.save_dir, 'log', 'train'), flush_secs=10)
+    valid_summary_writer = tensorboard.FileWriter(
+        logdir=os.path.join(args.save_dir, 'log', 'valid'), flush_secs=10)
+    tsw, vsw = train_summary_writer, valid_summary_writer
+
+    num_train_batches = data.train_size // data.batch_size 
+    logging.info('num_train_batches: %d' % num_train_batches)
+    validate_every = num_train_batches // 10
+    best_vaild_accuacy = 0
+    iter_count = 0
+    tic = time.time()
+
+    for epoch_num in range(args.max_epoch):
+        for batch_iter, train_batch in enumerate(data.train_minibatch_generator()):
+            progress = epoch_num + batch_iter / num_train_batches
+            iter_count += 1
+
+            train_loss, train_accuracy = train_iter(args, train_batch, **trpack)
+            add_scalar_summary(tsw, 'loss', train_loss, iter_count)
+            add_scalar_summary(tsw, 'acc', train_accuracy, iter_count)
+
+            if (batch_iter + 1) % (num_train_batches // 100) == 0:
+                tac = (time.time() - tic) / 60
+                print('   %.2f minutes\tprogress: %.2f' % (tac, progress))
+            if (batch_iter + 1) % validate_every == 0:
+                correct_sum = 0
+                for valid_batch in data.dev_minibatch_generator():
+                    correct, supplements = eval_iter(args, model, valid_batch)
+                    correct_sum += unwrap_scalar_variable(correct)
+                valid_accuracy = correct_sum / data.dev_size 
+                scheduler.step(valid_accuracy)
+                add_scalar_summary(vsw, 'acc', valid_accuracy, iter_count)
+                logging.info('Epoch %.2f: valid accuracy = %.4f' % (progress, valid_accuracy))
+                if valid_accuracy > best_vaild_accuacy:
+                    correct_sum = 0
+                    for test_batch in data.test_minibatch_generator():
+                        correct, supplements = eval_iter(args, model, test_batch)
+                        correct_sum += unwrap_scalar_variable(correct)
+                    test_accuracy = correct_sum / data.test_size
+                    best_vaild_accuacy = valid_accuracy
+                    model_filename = ('model-%.2f-%.3f-%.3f.pkl' % (progress, valid_accuracy, test_accuracy))
+                    model_path = os.path.join(args.save_dir, model_filename)
+                    torch.save(model.state_dict(), model_path)
+                    print('Saved the new best model to %s' % model_path)
+
+
+
+if __name__ == '__main__':
+    main()
+

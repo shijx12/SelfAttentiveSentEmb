@@ -1,73 +1,54 @@
-import json
-import argparse
+from tensorboard import summary
+from torch.autograd import Variable
+import torch
+
+def add_scalar_summary(summary_writer, name, value, step):
+    value = unwrap_scalar_variable(value)
+    summ = summary.scalar(name=name, scalar=value)
+    summary_writer.add_summary(summary=summ, global_step=step)
+
+def add_histo_summary(summary_writer, name, value, step):
+    value = value.view(-1).data.cpu().numpy()
+    summ = summary.histogram(name=name, values=value)
+    summary_writer.add_summary(summary=summ, global_step=step)
 
 
-class Dictionary(object):
-    def __init__(self, path=''):
-        self.word2idx = dict()
-        self.idx2word = list()
-        if path != '':  # load an external dictionary
-            words = json.loads(open(path, 'r').readline())
-            for item in words:
-                self.add_word(item)
-
-    def add_word(self, word):
-        if word not in self.word2idx:
-            self.idx2word.append(word)
-            self.word2idx[word] = len(self.idx2word) - 1
-        return self.word2idx[word]
-
-    def __len__(self):
-        return len(self.idx2word)
+def wrap_with_variable(tensor, volatile, cuda):
+    if cuda:
+        return Variable(tensor.cuda(), volatile=volatile)
+    else:
+        return Variable(tensor, volatile=volatile)
 
 
-def get_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--emsize', type=int, default=300,
-                        help='size of word embeddings')
-    parser.add_argument('--nhid', type=int, default=300,
-                        help='number of hidden units per layer')
-    parser.add_argument('--nlayers', type=int, default=2,
-                        help='number of layers in BiLSTM')
-    parser.add_argument('--attention-unit', type=int, default=350,
-                        help='number of attention unit')
-    parser.add_argument('--attention-hops', type=int, default=1,
-                        help='number of attention hops, for multi-hop attention model')
-    parser.add_argument('--dropout', type=float, default=0.5,
-                        help='dropout applied to layers (0 = no dropout)')
-    parser.add_argument('--clip', type=float, default=0.5,
-                        help='clip to prevent the too large grad in LSTM')
-    parser.add_argument('--nfc', type=int, default=512,
-                        help='hidden (fully connected) layer size for classifier MLP')
-    parser.add_argument('--lr', type=float, default=.001,
-                        help='initial learning rate')
-    parser.add_argument('--epochs', type=int, default=40,
-                        help='upper epoch limit')
-    parser.add_argument('--seed', type=int, default=1111,
-                        help='random seed')
-    parser.add_argument('--cuda', action='store_true',
-                        help='use CUDA')
-    parser.add_argument('--log-interval', type=int, default=200, metavar='N',
-                        help='report interval')
-    parser.add_argument('--save', type=str, default='',
-                        help='path to save the final model')
-    parser.add_argument('--dictionary', type=str, default='',
-                        help='path to save the dictionary, for faster corpus loading')
-    parser.add_argument('--word-vector', type=str, default='',
-                        help='path for pre-trained word vectors (e.g. GloVe), should be a PyTorch model.')
-    parser.add_argument('--train-data', type=str, default='',
-                        help='location of the training data, should be a json file')
-    parser.add_argument('--val-data', type=str, default='',
-                        help='location of the development data, should be a json file')
-    parser.add_argument('--test-data', type=str, default='',
-                        help='location of the test data, should be a json file')
-    parser.add_argument('--batch-size', type=int, default=32,
-                        help='batch size for training')
-    parser.add_argument('--class-number', type=int, default=2,
-                        help='number of classes')
-    parser.add_argument('--optimizer', type=str, default='Adam',
-                        help='type of optimizer')
-    parser.add_argument('--penalization-coeff', type=float, default=1, 
-                        help='the penalization coefficient')
-    return parser.parse_args()
+def unwrap_scalar_variable(var):
+    if isinstance(var, Variable):
+        return var.data[0]
+    else:
+        return var
 
+def unwrap_variable(var):
+    if isinstance(var, Variable):
+        return var.data
+    else:
+        return var
+
+
+def Frobenius(mat):
+    size = mat.size()
+    if len(size) == 3:  # batched matrix
+        ret = (torch.sum(torch.sum((mat ** 2), 1), 1) + 1e-10) ** 0.5
+        return torch.sum(ret) / size[0]
+    else:
+        raise Exception('matrix for computing Frobenius norm should be with 3 dims')
+
+def sequence_mask(sequence_length, max_length=None):
+    if max_length is None:
+        max_length = sequence_length.data.max()
+    batch_size = sequence_length.size(0)
+    seq_range = torch.arange(0, max_length).long()
+    seq_range_expand = seq_range.unsqueeze(0).expand(batch_size, max_length)
+    seq_range_expand = Variable(seq_range_expand)
+    if sequence_length.is_cuda:
+        seq_range_expand = seq_range_expand.cuda()
+    seq_length_expand = sequence_length.unsqueeze(1).expand_as(seq_range_expand)
+    return seq_range_expand < seq_length_expand
