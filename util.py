@@ -1,6 +1,7 @@
 from tensorboard import summary
 from torch.autograd import Variable
 import torch
+import spacy
 
 def add_scalar_summary(summary_writer, name, value, step):
     value = unwrap_scalar_variable(value)
@@ -41,7 +42,7 @@ def Frobenius(mat):
     else:
         raise Exception('matrix for computing Frobenius norm should be with 3 dims')
 
-def sequence_mask(sequence_length, max_length=None):
+def sequence_mask(sequence_length, max_length=None): # [batch_size, ]
     if max_length is None:
         max_length = sequence_length.data.max()
     batch_size = sequence_length.size(0)
@@ -52,3 +53,12 @@ def sequence_mask(sequence_length, max_length=None):
         seq_range_expand = seq_range_expand.cuda()
     seq_length_expand = sequence_length.unsqueeze(1).expand_as(seq_range_expand)
     return seq_range_expand < seq_length_expand
+
+tokenizer = None
+def spacy_tokenize(text):
+    global tokenizer
+    if tokenizer is None:
+        tokenizer = spacy.load('en')
+    words = [w.text for w in tokenizer(text) if w.text.strip()]
+    return words
+

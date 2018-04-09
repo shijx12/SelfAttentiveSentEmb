@@ -1,12 +1,19 @@
+from __future__ import print_function
+import spacy
 import pickle
 import numpy as np
 import torch
 import random
 import os
-import math
 
-class AGE2(object):
-    def __init__(self, datapath, batch_size=50):
+    tokenizer = spacy.load('en')
+            words = tokenizer(' '.join(item['text'].split()))
+            data = {
+                'text': map(lambda x: x.text.lower(), words)
+            }
+
+class YELP(object):
+    def __init__(self, datapath, batch_size=32):
         self.batch_size = batch_size
         self.datapath = datapath
         
@@ -25,8 +32,6 @@ class AGE2(object):
         self.train_size = len(self.train_set)
         self.dev_size = len(self.dev_set)
         self.test_size = len(self.test_set)
-        self.train_num_batch = int(math.ceil(self.train_size / self.batch_size))
-        self.trainset_bucket_shuffle()
         self.train_ptr = 0
         self.dev_ptr = 0
         self.test_ptr = 0
@@ -34,22 +39,11 @@ class AGE2(object):
     def wrap_numpy_to_longtensor(self, *args):
         return map(torch.LongTensor, args) 
 
-    def trainset_bucket_shuffle(self):
-        self.train_set.sort(key=lambda e: len(e[0])) # sort based on length
-        shuffle_unit = 250
-        for i in range(0, self.train_size, shuffle_unit): # shuffle for every unit
-            tmp = self.train_set[i: i+shuffle_unit]
-            random.shuffle(tmp)
-            self.train_set[i: i+shuffle_unit] = tmp
-        self.train_iter_idx = list(range(0, self.train_num_batch))
-        random.shuffle(self.train_iter_idx)
-
 
     def train_minibatch_generator(self):
-        while self.train_ptr < self.train_num_batch:
-            i = self.train_iter_idx[self.train_ptr]
-            self.train_ptr += 1
-            minibatch = self.train_set[i*self.batch_size : (i+1)*self.batch_size]
+        while self.train_ptr <= self.train_size - self.batch_size:
+            self.train_ptr += self.batch_size
+            minibatch = self.train_set[self.train_ptr - self.batch_size : self.train_ptr]
             l = np.max(map(lambda x: len(x[0]), minibatch), axis=0)
             sentences = np.zeros((self.batch_size, l), dtype='int32')
             labels = np.zeros((self.batch_size,), dtype='int32')
@@ -61,7 +55,7 @@ class AGE2(object):
             yield self.wrap_numpy_to_longtensor(sentences, lengths, labels)
         else:
             self.train_ptr = 0
-            self.trainset_bucket_shuffle()
+            random.shuffle(self.train_set)
             raise StopIteration
 
 
@@ -106,7 +100,7 @@ class AGE2(object):
 def dump():
     glove_path = '/data/share/glove.840B/glove.840B.300d.txt'
     data_dir = '/data/sjx/dataset/self-attentive-age2/'
-    save_path = '/data/sjx/self-attentive-Exp/data/age2.pickle'
+    save_path = './data/age2.pickle'
 
     print("loading GloVe...")
     w1 = {}

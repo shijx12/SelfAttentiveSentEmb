@@ -3,6 +3,8 @@ from __future__ import division
 from models import Classifier
 from util import *
 from dataset.age2 import AGE2
+from dataset.dbpedia import DBpedia
+from dataset.yahoo import Yahoo
 
 import torch
 import tensorboard
@@ -27,7 +29,12 @@ def train_iter(args, batch, **kw):
     length = wrap_with_variable(length, volatile=False, cuda=args.cuda)
     words = wrap_with_variable(words, volatile=False, cuda=args.cuda)
     label = wrap_with_variable(label, volatile=False, cuda=args.cuda)
-    logits, supplements = model.forward(words=words, length=length)
+    logits, supplements = model.forward(words=words, length=length, display=True)
+    
+    print('='*50)
+    for i in range(3):
+        print(supplements['info'][i])
+
     label_pred = logits.max(1)[1]
     accuracy = torch.eq(label, label_pred).float().mean()
     num_correct = torch.eq(label, label_pred).long().sum()
@@ -35,9 +42,17 @@ def train_iter(args, batch, **kw):
 
     if args.penalization_coeff > 0:
         I = kw['I']
-        attention = supplements['attention']
-        attentionT = torch.transpose(attention, 1, 2).contiguous()
-        extra_loss = Frobenius(torch.bmm(attention, attentionT) - I)
+        A = supplements.get('attention', None)
+        # [bsz, hop, len] or list of that. For divergence optimization.
+        if type(A)==list:
+            extra_loss = 0
+            for a in A:
+                extra_loss += Frobenius(torch.bmm(a, torch.transpose(a, 1, 2).contiguous()) - I)
+            extra_loss /= len(A)
+        elif A is not None:
+            extra_loss = Frobenius(torch.bmm(A, torch.transpose(A, 1, 2).contiguous()) - I)
+        else:
+            extra_loss = 0
         loss += args.penalization_coeff * extra_loss
 
     optimizer.zero_grad()
@@ -63,26 +78,28 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--word-dim', type=int, default=300, help='size of word embeddings')
     parser.add_argument('--hidden-dim', type=int, default=300, help='number of hidden units per layer')
-    parser.add_argument('--num-layers', type=int, default=2, help='number of layers in BiLSTM')
+    parser.add_argument('--num-layers', type=int, default=1, help='number of layers in BiLSTM')
     parser.add_argument('--att-dim', type=int, default=350, help='number of attention unit')
     parser.add_argument('--att-hops', type=int, default=4, help='number of attention hops, for multi-hop attention model')
     parser.add_argument('--clf-hidden-dim', type=int, default=512, help='hidden (fully connected) layer size for classifier MLP')
-    parser.add_argument('--penalization-coeff', type=float, default=1, help='the penalization coefficient')
     parser.add_argument('--clip', type=float, default=0.5, help='clip to prevent the too large grad in LSTM')
     parser.add_argument('--lr', type=float, default=.001, help='initial learning rate')
     parser.add_argument('--weight-decay', type=float, default=1e-5, help='weight decay rate per batch')
-    parser.add_argument('--dropout', type=float, default=0.5)
-    parser.add_argument('--max-epoch', type=int, default=20)
-    parser.add_argument('--seed', type=int, default=1111)
+    parser.add_argument('--dropout', type=float, default=0.3)
+    parser.add_argument('--max-epoch', type=int, default=8)
+    parser.add_argument('--seed', type=int, default=666)
     parser.add_argument('--cuda', action='store_true', default=True)
     parser.add_argument('--optimizer', default='adam', choices=['adam', 'sgd'])
     parser.add_argument('--batch-size', type=int, default=32, help='batch size for training')
-
-
-    parser.add_argument('--num-classes', type=int, default=5, help='number of classes')
-    parser.add_argument('--data', type=str, default='./data/age2.pickle')
-    parser.add_argument('--save-dir', type=str, required=True, help='path to save the final model')
+    parser.add_argument('--penalization-coeff', type=float, default=0.1, help='the penalization coefficient')
     parser.add_argument('--fix-word-embedding', action='store_true')
+
+
+    parser.add_argument('--model-type', required=True, choices=['sa', 'avgblock', 'hard'])
+    parser.add_argument('--data-type', required=True, choices=['age2', 'dbpedia', 'yahoo'])
+    parser.add_argument('--data', required=True, help='pickle file obtained by dataset dump')
+    parser.add_argument('--save-dir', type=str, required=True, help='path to save the final model')
+    parser.add_argument('--block-size', type=int, default=-1, help='block size only when model-type is avgblock')
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -106,9 +123,25 @@ def main():
     for k, v in vars(args).items():
         logging.info(k+':'+str(v))
 
+    #####################################################################
+    if args.data_type == 'age2':
+        data = AGE2(datapath=args.data, batch_size=args.batch_size)
+        num_classes = 5
+    elif args.data_type == 'dbpedia':
+        data = DBpedia(datapath=args.data, batch_size=args.batch_size)
+        num_classes = 14
+    elif args.data_type == 'yahoo':
+        data = Yahoo(datapath=args.data, batch_size=args.batch_size)
+        num_classes = 10
+    else:
+        raise Exception('Invalid argument data-type')
+    #####################################################################
+    if args.model_type == 'avgblock':
+        assert args.block_size > 0
+    #####################################################################
 
-    data = AGE2(datapath=args.data, batch_size=args.batch_size)
 
+    tic = time.time()
     model = Classifier(
         dictionary=data,
         dropout=args.dropout,
@@ -119,8 +152,11 @@ def main():
         att_dim=args.att_dim,
         att_hops=args.att_hops,
         clf_hidden_dim=args.clf_hidden_dim,
-        num_classes=args.num_classes
+        num_classes=num_classes,
+        model_type=args.model_type,
+        block_size=args.block_size,
     )
+    print('It takes %.2f sec to build the model.' % (time.time() - tic))
     logging.info(model)
 
     model.word_embedding.weight.data.set_(data.weight)
@@ -163,23 +199,22 @@ def main():
         logdir=os.path.join(args.save_dir, 'log', 'valid'), flush_secs=10)
     tsw, vsw = train_summary_writer, valid_summary_writer
 
-    num_train_batches = data.train_size // data.batch_size 
-    logging.info('num_train_batches: %d' % num_train_batches)
-    validate_every = num_train_batches // 10
+    logging.info('number of train batches: %d' % data.train_num_batch)
+    validate_every = data.train_num_batch // 10
     best_vaild_accuacy = 0
     iter_count = 0
     tic = time.time()
 
     for epoch_num in range(args.max_epoch):
         for batch_iter, train_batch in enumerate(data.train_minibatch_generator()):
-            progress = epoch_num + batch_iter / num_train_batches
+            progress = epoch_num + batch_iter / data.train_num_batch 
             iter_count += 1
 
             train_loss, train_accuracy = train_iter(args, train_batch, **trpack)
             add_scalar_summary(tsw, 'loss', train_loss, iter_count)
             add_scalar_summary(tsw, 'acc', train_accuracy, iter_count)
 
-            if (batch_iter + 1) % (num_train_batches // 100) == 0:
+            if (batch_iter + 1) % (data.train_num_batch // 100) == 0:
                 tac = (time.time() - tic) / 60
                 print('   %.2f minutes\tprogress: %.2f' % (tac, progress))
             if (batch_iter + 1) % validate_every == 0:
@@ -198,7 +233,7 @@ def main():
                         correct_sum += unwrap_scalar_variable(correct)
                     test_accuracy = correct_sum / data.test_size
                     best_vaild_accuacy = valid_accuracy
-                    model_filename = ('model-%.2f-%.3f-%.3f.pkl' % (progress, valid_accuracy, test_accuracy))
+                    model_filename = ('model-%.2f-%.4f-%.4f.pkl' % (progress, valid_accuracy, test_accuracy))
                     model_path = os.path.join(args.save_dir, model_filename)
                     torch.save(model.state_dict(), model_path)
                     print('Saved the new best model to %s' % model_path)
